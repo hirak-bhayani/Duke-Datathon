@@ -1,0 +1,157 @@
+#Loading required packages
+library(ggplot2)
+library(tidyverse)
+library(stringr)
+library(ROSE)
+install.packages(c("tidyr", "devtools"))
+devtools::install_github("garrettgman/DSR")
+library(DSR)
+
+#Loading the training data
+data = read.csv("v_train.csv")
+
+#Loading the interest categories data
+interest = read.csv("topics.csv")
+
+#Merging the data frames
+total <- merge(data,interest ,by="topic_id")
+head(total)
+
+#Subseting the data to get the only the desired columns. We get rid of the short-term interest here
+data = total  [, c(2:4,6)]
+
+##aggregate the data 
+data_aggr = data %>% group_by(userID, Main, inAudience) %>%summarize(Sum=sum(ltiFeatures))
+
+##spreading the data to reshape
+data1 = spread(data_aggr, Main, Sum)
+
+#Imputing the NAs to 0 - as users who have no interest levels mentioned for a certain topic can be assumed 
+#to have no history of expoure to those topics
+data1[is.na(data1)] <- 0
+
+#Converting the convertion target variable from boolean to integer
+data1$inAudience <- as.integer(as.logical(data1$inAudience))
+
+#Renaming column names
+data1 <- data1 %>% rename(arts = "Arts & Entertainment", autos = "Autos & Vehicles", beauty = "Beauty & Fitness", books = "Books & Literature", business = "Business & Industrial", computer = "Computers & Electronics", food = "Food & Drink", hobbies = "Hobbies & Leisure", home = "Home & Garden", internet = "Internet & Telecom", jobs = "Jobs & Education", finance = "Finance", games = "Games", health = "Health", law = "Law & Government", news = "News", online = "Online Communities", people = "People & Society", pets = "Pets & Animals", real_estate = "Real Estate", reference = "Reference", science = "Science", shopping = "Shopping", sports = "Sports", travel = "Travel" )
+
+#Oversampling and undersampling
+n_new <- nrow(data1)
+fraction_new = 0.5
+sampling_result = ovun.sample(inAudience ~ .-userID,
+                                data = data1,
+                                method = "both",
+                                N = n_new,
+                                p = fraction_new,
+                                seed = 1)
+
+
+sampled_result <- sampling_result$data
+table(sampled_result$inAudience)
+
+#MODELLING
+#Tree with sampled training set
+tree_sample <- rpart(inAudience~.-userID, data=sampled_result, method="class")
+library(rpart.plot)
+rpart.plot(tree_sample)
+#Variable importance
+tree_sample$variable.importance
+
+#Random forest
+library(randomForest)
+set.seed(123)
+sample_random <- randomForest(factor(inAudience)~.-userID, data=sampled_result, importance=T, ntree=500)
+sample_random$importance
+sample_random$err.rate
+print(sample_random)
+
+#SVM (Support Vector Machine)
+library(e1071)
+sampled_svm = svm(inAudience~.-userID, data=sampled_result, type="C-classification", kernel="linear")
+summary(sampled_svm)
+
+#kNN
+#kNN
+library(class)
+ran <- sample(1:nrow(sampled_result), 0.9 * nrow(iris)) 
+##extract training set
+train <- sampled_result[ran,] 
+##extract testing set
+test <- sampled_result[-ran,] 
+##extract target column of train dataset because it will be used as 'cl' argument in knn function.
+target <- sampled_result[ran,2]
+
+##extract target column of test data to measure the accuracy
+test_category <- sampled_result[-ran,2]
+pr <- knn(train,test,cl=target,k=13)
+
+tab <- table(pr,test_category)
+print(tab)
+
+#VALIDATION
+#Clean up the validation data
+val = read.csv("v_val.csv")
+
+#Merging validation data with interest topic data and selecting appropriate columns
+val_merge <- merge(val,interest ,by="topic_id")
+val = val_merge[, c(2:4,6)]
+val_aggr = val%>% group_by(userID, Main, inAudience) %>%summarize(Sum=sum(ltiFeatures))
+
+#Spreading the validation data and imputing NAs to 0
+val = spread(val_aggr, Main, Sum)
+val[is.na(val)] <- 0
+val$inAudience <- as.integer(as.logical(val$inAudience))
+
+#Renaming the columns
+val <- val %>% rename(arts = "Arts & Entertainment", autos = "Autos & Vehicles", beauty = "Beauty & Fitness", books = "Books & Literature", business = "Business & Industrial", computer = "Computers & Electronics", food = "Food & Drink", hobbies = "Hobbies & Leisure", home = "Home & Garden", internet = "Internet & Telecom", jobs = "Jobs & Education", finance = "Finance", games = "Games", health = "Health", law = "Law & Government", news = "News", online = "Online Communities", people = "People & Society", pets = "Pets & Animals", real_estate = "Real Estate", reference = "Reference", science = "Science", shopping = "Shopping", sports = "Sports", travel = "Travel" )
+
+#Validation for the random forest
+val$pred.rf <- predict(sample_random, newdata=val)
+
+#Validation for SVM
+val$pred.svm = predict(sampled_svm, newdata=val)
+
+#XGBoost and Validation
+library(xgboost)
+library(caTools)
+
+#Setting up the parameters
+param <- list(booster="gbtree", #gbtree for tree model #gblinear for linear model
+              objective="multi:softprob", #to get a probability
+              eval_metric="mlogloss",
+              #nthread=13, #number of parallel processing we need
+              num_class=3, 
+              eta = .01, #learning rate - smaller is better
+              gamma = 1, #loss reduction before moving on to next split (usually 1)
+              max_depth = 4, 
+              min_child_weight = 1, 
+              subsample = .7, #sampling from training data in every iteration of XGBoost
+              colsample_bytree = .5 #sample of columns to be sampled in every iteration
+)
+inAudience = sampled_result$inAudience
+label = sampled_result$inAudience
+sampled_result$inAudience = NULL
+
+n = nrow(sampled_result)
+train.index = sample(n,floor(0.75*n))
+train.data = as.matrix(sampled_result)
+train.label = label[train.index]
+xgb.train = xgb.DMatrix(data=train.data,label=train.label)
+
+#Running the model
+xgb.fit=xgb.train(
+  params=param,
+  data=xgb.train,
+  nrounds=5000,
+  nthreads=1,
+  early_stopping_rounds=10,
+  watchlist=list(val1=xgb.train,val2=xgb.test),
+  verbose=0
+)
+
+#Creating predictions for the validation data
+xgb.pred = predict(xgb.fit,val2, reshape = T)
+xgb.pred
+val$pred.xg.val = (xgb.pred[,1])
+val$pred.xg = ifelse(val$pred.xg.val < 0.5, 1, 0)
